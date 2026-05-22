@@ -16,7 +16,10 @@ The original project code is under the custom license in `LICENSE`.
 
 In short:
 
-- Use is allowed with credit.
+- Private forks are allowed for your own personal, educational, research, or
+  internal use.
+- Public content based on the project must include credit and a visible link
+  back to veroxsity / BanditVault.
 - Redistribution is not allowed without prior written permission from
   veroxsity / BanditVault.
 - Third-party components keep their own licenses and terms.
