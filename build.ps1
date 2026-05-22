@@ -79,25 +79,31 @@ Remove-Item -Recurse -Force $pkg -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "Assets") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "natives") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $pkg "assets") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $pkg "game") | Out-Null
-New-Item -ItemType Directory -Force -Path (Join-Path $pkg "game\log_configs") | Out-Null
+# runtime/ holds the immutable game stack (libraries, versions, fabric remapped
+# jars, bundled mods, log configs). Writable state (saves, mods folder,
+# config, logs) lives in LocalState and is set up by App.cpp at startup.
+New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\log_configs") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $pkg "runtime\bundled-mods") | Out-Null
 
 Copy-Item $mcExe (Join-Path $pkg "MC.Xbox.exe")
 Copy-Item (Join-Path $root "MC.Xbox\Package.appxmanifest") (Join-Path $pkg "AppxManifest.xml")
 
-Write-Host "Copying game files..."
-Copy-Item -Recurse (Join-Path $gameDir "libraries") (Join-Path $pkg "game\libraries")
-Copy-Item -Recurse (Join-Path $gameDir "versions") (Join-Path $pkg "game\versions")
-Copy-Item -Recurse (Join-Path $gameDir "mods") (Join-Path $pkg "game\mods")
+Write-Host "Copying runtime files..."
+Copy-Item -Recurse (Join-Path $gameDir "libraries") (Join-Path $pkg "runtime\libraries")
+Copy-Item -Recurse (Join-Path $gameDir "versions")  (Join-Path $pkg "runtime\versions")
+# Bundled mods (compat mod, optionally diagnostics) live under runtime\bundled-mods.
+# App.cpp copies them into LocalState\game\mods on launch.
+Copy-Item -Recurse (Join-Path $gameDir "mods\*") (Join-Path $pkg "runtime\bundled-mods\") -Force
 if (Test-Path (Join-Path $gameDir ".fabric")) {
-    Copy-Item -Recurse (Join-Path $gameDir ".fabric") (Join-Path $pkg "game\.fabric")
+    Copy-Item -Recurse (Join-Path $gameDir ".fabric") (Join-Path $pkg "runtime\.fabric")
 }
 
 $remapped = Join-Path $gameDir ".fabric\remappedJars"
 if (Test-Path $remapped) {
     Write-Host "Copying .fabric remapped jars..."
-    New-Item -ItemType Directory -Force (Join-Path $pkg "game\.fabric\remappedJars") | Out-Null
-    Copy-Item -Recurse (Join-Path $remapped "*") (Join-Path $pkg "game\.fabric\remappedJars\") -Force
+    New-Item -ItemType Directory -Force (Join-Path $pkg "runtime\.fabric\remappedJars") | Out-Null
+    Copy-Item -Recurse (Join-Path $remapped "*") (Join-Path $pkg "runtime\.fabric\remappedJars\") -Force
 }
 
 Write-Host "Copying natives..."
@@ -124,7 +130,7 @@ if (Test-Path $jnaJar) {
 
 Write-Host "Injecting GLFW shim into LWJGL JAR..."
 $lwjglGlfwVersion = $ProjectConfig.LwjglGlfwVersion
-$glfwJar  = Join-Path $pkg "game\libraries\org\lwjgl\lwjgl-glfw\$lwjglGlfwVersion\lwjgl-glfw-$lwjglGlfwVersion-natives-windows.jar"
+$glfwJar  = Join-Path $pkg "runtime\libraries\org\lwjgl\lwjgl-glfw\$lwjglGlfwVersion\lwjgl-glfw-$lwjglGlfwVersion-natives-windows.jar"
 $jarExe   = Join-Path $jreSrc "bin\jar.exe"
 if (-not (Test-Path $jarExe)) { $jarExe = "jar" }
 
@@ -167,7 +173,7 @@ foreach ($dll in Get-MesaRuntimeDllNames) {
 
 Write-Host "Copying assets..."
 Copy-Item -Recurse -Force (Join-Path $assetsDir "*") (Join-Path $pkg "assets\")
-Copy-Item -Force (Join-Path $root "log_configs\client-uwp.xml") (Join-Path $pkg "game\log_configs\client-uwp.xml")
+Copy-Item -Force (Join-Path $root "log_configs\client-uwp.xml") (Join-Path $pkg "runtime\log_configs\client-uwp.xml")
 
 Write-Host "Copying JRE..."
 Write-Host "JRE source: $jreSrc"

@@ -10,6 +10,7 @@
 #include <windows.ui.core.h>
 #include <windows.foundation.h>
 #include <windows.foundation.collections.h>
+#include <windows.storage.h>
 #include <jni.h>
 #include <io.h>
 #include <fcntl.h>
@@ -38,6 +39,7 @@ using namespace ABI::Windows::ApplicationModel::Core;
 using namespace ABI::Windows::UI::Core;
 using namespace ABI::Windows::Foundation;
 using namespace ABI::Windows::Foundation::Collections;
+using namespace ABI::Windows::Storage;
 
 static std::wstring g_logDir;
 static bool g_setWindowCalled = false;
@@ -126,9 +128,108 @@ static void CopyDirectoryContentsIfMissing(const std::wstring& src, const std::w
     FindClose(h);
 }
 
+static std::wstring ResolveLocalStateDir() {
+    ComPtr<IApplicationDataStatics> appDataStatics;
+    HRESULT hr = GetActivationFactory(
+        HStringReference(RuntimeClass_Windows_Storage_ApplicationData).Get(),
+        &appDataStatics);
+    if (FAILED(hr)) return std::wstring();
+
+    ComPtr<IApplicationData> appData;
+    if (FAILED(appDataStatics->get_Current(&appData))) return std::wstring();
+
+    ComPtr<IStorageFolder> localFolder;
+    if (FAILED(appData->get_LocalFolder(&localFolder))) return std::wstring();
+
+    ComPtr<IStorageItem> localItem;
+    if (FAILED(localFolder.As(&localItem))) return std::wstring();
+
+    HSTRING pathHandle = nullptr;
+    if (FAILED(localItem->get_Path(&pathHandle)) || !pathHandle) return std::wstring();
+
+    UINT32 len = 0;
+    PCWSTR raw = WindowsGetStringRawBuffer(pathHandle, &len);
+    std::wstring result;
+    if (raw) result.assign(raw, len);
+    WindowsDeleteString(pathHandle);
+    return result;
+}
+
+static const std::wstring& ResolveLogDir() {
+    static std::wstring logDir;
+    if (!logDir.empty()) return logDir;
+
+    const std::wstring localState = ResolveLocalStateDir();
+    if (!localState.empty()) {
+        logDir = localState + L"\\logs";
+    } else {
+        logDir = GetExecutableDir();
+    }
+    EnsureDirectoryTree(logDir);
+    return logDir;
+}
+
+static bool IsDirEmpty(const std::wstring& dir) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;
+    do {
+        if (wcscmp(fd.cFileName, L".") != 0 && wcscmp(fd.cFileName, L"..") != 0) {
+            FindClose(h);
+            return false;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return true;
+}
+
+static void CopyDirectoryContentsForce(const std::wstring& src, const std::wstring& dst) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((src + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    EnsureDirectoryTree(dst);
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        const std::wstring srcPath = src + L"\\" + fd.cFileName;
+        const std::wstring dstPath = dst + L"\\" + fd.cFileName;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            CopyDirectoryContentsForce(srcPath, dstPath);
+        } else {
+            EnsureDirectoryTree(GetParentDir(dstPath));
+            CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE);
+        }
+    } while (FindNextFileW(h, &fd));
+
+    FindClose(h);
+}
+
+static void EnsureLocalStateLayout(const std::wstring& localState, const std::wstring& exeDir) {
+    if (localState.empty()) return;
+
+    EnsureDirectoryTree(localState + L"\\game");
+    EnsureDirectoryTree(localState + L"\\game\\mods");
+    EnsureDirectoryTree(localState + L"\\game\\saves");
+    EnsureDirectoryTree(localState + L"\\game\\config");
+    EnsureDirectoryTree(localState + L"\\game\\resourcepacks");
+    EnsureDirectoryTree(localState + L"\\game\\shaderpacks");
+    EnsureDirectoryTree(localState + L"\\game\\screenshots");
+    EnsureDirectoryTree(localState + L"\\game\\crash-reports");
+    EnsureDirectoryTree(localState + L"\\logs");
+    EnsureDirectoryTree(localState + L"\\tmp");
+
+    // Bundled mods (compat mod, optional diagnostics mod) live in the
+    // immutable package install dir and get force-copied into LocalState's
+    // mods folder on every launch. Force-copy ensures appx updates also
+    // refresh the bundled mod jars. User-added mods sit alongside untouched.
+    const std::wstring bundledMods = exeDir + L"\\runtime\\bundled-mods";
+    if (GetFileAttributesW(bundledMods.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        CopyDirectoryContentsForce(bundledMods, localState + L"\\game\\mods");
+    }
+}
 static void WriteLog(const wchar_t* msg) {
     if (g_logDir.empty()) {
-        g_logDir = GetExecutableDir();
+        g_logDir = ResolveLogDir();
     }
     if (g_logDir.empty()) return;
 
@@ -332,20 +433,26 @@ static bool CheckAndLogJavaException(JNIEnv* env, const wchar_t* stage) {
 }
 
 static bool RunEmbeddedMinecraft(const std::wstring& exeDir,
+    const std::wstring& runtimeDir,
     const std::wstring& gameDir,
     const std::wstring& assetsDir,
     const std::wstring& nativesDir,
+    const std::wstring& tmpDir,
     const std::wstring& clientJar,
     const std::wstring& javaLog,
     const std::wstring& argsPath,
     const std::wstring& classPath)
 {
     const std::wstring jreDir = exeDir + L"\\jre";
-    const std::wstring jnaTmpDir = nativesDir;
-    const std::wstring lwjglTmpDir = exeDir;
-    const std::wstring logConfigPath = gameDir + L"\\log_configs\\client-uwp.xml";
+    // JNA and LWJGL need writable scratch space to unpack bundled natives.
+    // On UWP, LocalState is the only reliably-writable location across
+    // retail and Dev Mode, so we use the LocalState tmp dir for both.
+    const std::wstring jnaTmpDir = tmpDir;
+    const std::wstring lwjglTmpDir = tmpDir;
+    // log_configs ships in the immutable runtime tree, not LocalState.
+    const std::wstring logConfigPath = runtimeDir + L"\\log_configs\\client-uwp.xml";
 
-    EnsureDirectoryTree(gameDir + L"\\logs");
+    EnsureDirectoryTree(jnaTmpDir);
     EnsureDirectoryTree(gameDir + L"\\crash-reports");
 
     if (!RedirectStdStreams(javaLog)) {
@@ -489,7 +596,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetWindow(ICoreWindow* window) override {
         g_setWindowCalled = true;
         if (g_logDir.empty()) {
-            g_logDir = GetExecutableDir();
+            g_logDir = ResolveLogDir();
         }
         EnsureDirectoryTree(g_logDir);
 
@@ -521,22 +628,34 @@ public:
 
     HRESULT STDMETHODCALLTYPE Run() override
     {
-        const std::wstring exeDir = GetExecutableDir();
-        const std::wstring gameDir = exeDir + L"\\game";
-        const std::wstring javaExe = exeDir + L"\\jre\\bin\\java.exe";
-        const std::wstring assetsDir = exeDir + L"\\assets";
-        const std::wstring nativesDir = exeDir + L"\\natives";
+        const std::wstring exeDir       = GetExecutableDir();
+        const std::wstring localState   = ResolveLocalStateDir();
+        const std::wstring runtimeDir   = exeDir + L"\\runtime";
+        const std::wstring gameDir      = (localState.empty() ? exeDir + L"\\game" : localState + L"\\game");
+        const std::wstring logDir       = (localState.empty() ? exeDir : localState + L"\\logs");
+        const std::wstring tmpDir       = (localState.empty() ? exeDir : localState + L"\\tmp");
+        const std::wstring javaExe      = exeDir + L"\\jre\\bin\\java.exe";
+        const std::wstring assetsDir    = exeDir + L"\\assets";
+        const std::wstring nativesDir   = exeDir + L"\\natives";
         const std::wstring minecraftVersion = kMinecraftVersionW;
-        const std::wstring clientJar = gameDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
-        const std::wstring argsPath = exeDir + L"\\java_args.txt";
-        const std::wstring javaLog = exeDir + L"\\java_output.log";
+        const std::wstring clientJar    = runtimeDir + L"\\versions\\" + minecraftVersion + L"\\" + minecraftVersion + L".jar";
+        const std::wstring argsPath     = logDir + L"\\java_args.txt";
+        const std::wstring javaLog      = logDir + L"\\java_output.log";
 
-        g_logDir = exeDir;
+        // Seed the writable LocalState layout before touching the JVM. This
+        // is idempotent and force-copies bundled mods so appx updates refresh
+        // them, while user-added mods sit alongside untouched.
+        EnsureLocalStateLayout(localState, exeDir);
+
+        g_logDir = logDir;
+        EnsureDirectoryTree(g_logDir);
         SetCurrentDirectoryW(exeDir.c_str());
         SetEnvironmentVariableW(L"MC_RUNTIME_DIR", exeDir.c_str());
+        SetEnvironmentVariableW(L"MC_GAME_DIR", gameDir.c_str());
+        SetEnvironmentVariableW(L"MC_LOCALSTATE_DIR", localState.c_str());
 
         wchar_t lp[MAX_PATH];
-        swprintf_s(lp, L"%s\\mc_launch.log", exeDir.c_str());
+        swprintf_s(lp, L"%s\\mc_launch.log", g_logDir.c_str());
         FILE* clf = nullptr;
         _wfopen_s(&clf, lp, L"w");
         if (clf) fclose(clf);
@@ -550,19 +669,24 @@ public:
         GetCurrentDirectoryW(MAX_PATH, cwd);
         WriteLogF(L"cwd=%s", cwd);
         if (g_windowHandle) {
-            if (WriteHwndFile(exeDir, g_windowHandle)) {
+            if (WriteHwndFile(g_logDir, g_windowHandle)) {
                 WriteLog(L"Run: rewrote hwnd.txt from stored HWND");
             } else {
                 WriteLogF(L"Run: failed to rewrite hwnd.txt err=%u", GetLastError());
             }
         }
-        WriteLogF(L"exeDir: %s", exeDir.c_str());
-        WriteLogF(L"java.exe  exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
-        WriteLogF(L"gameDir   exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
-        WriteLogF(L"clientJar exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
+        WriteLogF(L"exeDir:     %s", exeDir.c_str());
+        WriteLogF(L"localState: %s", localState.empty() ? L"<unavailable>" : localState.c_str());
+        WriteLogF(L"runtimeDir: %s", runtimeDir.c_str());
+        WriteLogF(L"gameDir:    %s", gameDir.c_str());
+        WriteLogF(L"logDir:     %s", g_logDir.c_str());
+        WriteLogF(L"java.exe   exists=%d", GetFileAttributesW(javaExe.c_str()) != INVALID_FILE_ATTRIBUTES);
+        WriteLogF(L"runtimeDir exists=%d", GetFileAttributesW(runtimeDir.c_str()) != INVALID_FILE_ATTRIBUTES);
+        WriteLogF(L"gameDir    exists=%d", GetFileAttributesW(gameDir.c_str()) != INVALID_FILE_ATTRIBUTES);
+        WriteLogF(L"clientJar  exists=%d", GetFileAttributesW(clientJar.c_str()) != INVALID_FILE_ATTRIBUTES);
 
         std::vector<std::wstring> jars;
-        CollectJars(gameDir + L"\\libraries", jars);
+        CollectJars(runtimeDir + L"\\libraries", jars);
         jars.push_back(clientJar);
         WriteLogF(L"JAR count: %zu", jars.size());
 
@@ -572,7 +696,7 @@ public:
             cp += fwd(jars[i]);
         }
         WriteLog(L"Launching embedded JVM");
-        if (!RunEmbeddedMinecraft(exeDir, gameDir, assetsDir, nativesDir, clientJar, javaLog, argsPath, cp)) {
+        if (!RunEmbeddedMinecraft(exeDir, runtimeDir, gameDir, assetsDir, nativesDir, tmpDir, clientJar, javaLog, argsPath, cp)) {
             WriteLog(L"Embedded JVM launch failed");
             return E_FAIL;
         }
