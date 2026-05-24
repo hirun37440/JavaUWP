@@ -1,0 +1,70 @@
+name: Build JavaUWP
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Set up Python 3
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Install Python dependencies
+      run: py -m pip install pillow
+
+    - name: Set up Visual Studio Build Tools
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Download libraries
+      shell: powershell
+      run: .\scripts\download-libs.ps1
+
+    - name: Download assets
+      shell: powershell
+      run: .\scripts\download-assets.ps1
+
+    - name: Set up Fabric Loader
+      shell: powershell
+      run: |
+        java -jar .\staging\cache\tools\fabric-installer.jar client `
+          -dir .\staging\cache\gameDir `
+          -mcversion 1.21.11 `
+          -loader 0.19.2 `
+          -launcher win32
+
+    - name: Patch Fabric Loader
+      shell: powershell
+      run: .\scripts\patch-fabric.ps1
+
+    - name: Build Package
+      shell: powershell
+      run: .\build.ps1
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      if: success()
+      with:
+        name: JavaUWP-appx
+        path: output/MC_Java_*.appx
+
+    - name: Clean up
+      shell: powershell
+      if: always()
+      run: .\scripts\clean.ps1 -Apply
