@@ -6,56 +6,69 @@ $root = Resolve-RepoRoot
 $gameDir = Get-ConfigPath "GameDir"
 $version = $ProjectConfig.MinecraftVersion
 
-try {
-    $response = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
-    if (-not $response -or -not $response.Content) {
-        throw "Empty response from version manifest API"
+# Try to load manifest from local cache first, then from API
+$localManifestPath = Join-Path $PSScriptRoot "manifests\version_manifest_v2.json"
+$manifest = $null
+
+if (Test-Path $localManifestPath) {
+    try {
+        Write-Host "Loading manifest from local cache: $localManifestPath"
+        $manifest = Get-Content $localManifestPath | ConvertFrom-Json
+    } catch {
+        Write-Warning "Failed to load local manifest: $_"
     }
-    $manifest = $response | ConvertFrom-Json
-    if (-not $manifest) {
-        throw "Failed to parse JSON response"
-    }
-} catch {
-    Write-Error "Failed to download version manifest: $_"
-    exit 1
 }
 
-# ... rest of the script remains the same
+if (-not $manifest) {
+    try {
+        Write-Host "Downloading manifest from Mojang API..."
+        $response = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+        $manifest = $response | ConvertFrom-Json
+    } catch {
+        Write-Error "Failed to download version manifest: $_"
+        exit 1
+    }
+}
+
 $v = $manifest.versions | Where-Object { $_.id -eq $version } | Select-Object -First 1
 if (-not $v) {
     throw "Minecraft version $version not found in manifest."
 }
 
 try {
-    $response = Invoke-WebRequest -Uri $v.url -TimeoutSec 30
-    $vj = $response.Content | ConvertFrom-Json
+    $vj = Invoke-WebRequest -Uri $v.url | ConvertFrom-Json
 } catch {
-    throw "Failed to download version JSON: $_"
+    Write-Error "Failed to download version JSON from $($v.url): $_"
+    exit 1
 }
 
-# Download asset index
-$assetIndexUrl = $vj.assetIndex.url
-$assetIndexId = $vj.assetIndex.id
-Write-Host "Downloading asset index: $assetIndexId"
-Invoke-WebRequest -Uri $assetIndexUrl -OutFile "$assetsDir\indexes\$assetIndexId.json"
+$versionDir = Join-Path $gameDir "versions\$version"
+New-Item -ItemType Directory -Force -Path $versionDir | Out-Null
 
-# Download all assets
-$index = Get-Content "$assetsDir\indexes\$assetIndexId.json" | ConvertFrom-Json
-$objects = $index.objects.PSObject.Properties
-$total = ($objects | Measure-Object).Count
-$i = 0
+$clientUrl = $vj.downloads.client.url
+$clientJar = Join-Path $versionDir "$version.jar"
+try {
+    Invoke-WebRequest -Uri $clientUrl -OutFile $clientJar
+} catch {
+    Write-Error "Failed to download client jar from $clientUrl`: $_"
+    exit 1
+}
+Write-Host "Client jar done -> $clientJar"
 
-foreach ($obj in $objects) {
-    $hash = $obj.Value.hash
-    $subdir = $hash.Substring(0, 2)
-    $destDir = "$assetsDir\objects\$subdir"
-    $dest = "$destDir\$hash"
-    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+$libs = $vj.libraries | Where-Object { $_.downloads.artifact -ne $null }
+foreach ($lib in $libs) {
+    $artifact = $lib.downloads.artifact
+    $dest = Join-Path $gameDir ("libraries\" + $artifact.path.Replace('/', '\'))
+    New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
     if (-not (Test-Path $dest)) {
-        $url = "https://resources.download.minecraft.net/$subdir/$hash"
-        Invoke-WebRequest -Uri $url -OutFile $dest
+        try {
+            Invoke-WebRequest -Uri $artifact.url -OutFile $dest
+            Write-Host "Downloaded: $($artifact.path)"
+        } catch {
+            Write-Error "Failed to download library $($artifact.path) from $($artifact.url): $_"
+            exit 1
+        }
     }
-    $i++
-    if ($i % 100 -eq 0) { Write-Host "$i / $total assets downloaded" }
 }
-Write-Host "All $total assets downloaded"
+
+Write-Host "All done"
