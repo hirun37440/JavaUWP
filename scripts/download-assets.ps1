@@ -1,22 +1,26 @@
-# Download Minecraft assets for the configured game version.
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "common.ps1")
 
 $root = Resolve-RepoRoot
+$gameDir = Get-ConfigPath "GameDir"
 $version = $ProjectConfig.MinecraftVersion
-$assetsDir = Get-ConfigPath "AssetsDir"
 
-New-Item -ItemType Directory -Force -Path "$assetsDir\indexes" | Out-Null
-New-Item -ItemType Directory -Force -Path "$assetsDir\objects" | Out-Null
-
-## Get version json to find asset index
 try {
-    $response = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json' -TimeoutSec 30
-    $manifest = $response.Content | ConvertFrom-Json
+    $response = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+    if (-not $response -or -not $response.Content) {
+        throw "Empty response from version manifest API"
+    }
+    $manifest = $response | ConvertFrom-Json
+    if (-not $manifest) {
+        throw "Failed to parse JSON response"
+    }
 } catch {
-    throw "Failed to download version manifest: $_"
+    Write-Error "Failed to download version manifest: $_"
+    exit 1
 }
+
+# ... rest of the script remains the same
 $v = $manifest.versions | Where-Object { $_.id -eq $version } | Select-Object -First 1
 if (-not $v) {
     throw "Minecraft version $version not found in manifest."
