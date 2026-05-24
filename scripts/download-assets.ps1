@@ -10,13 +10,24 @@ $assetsDir = Get-ConfigPath "AssetsDir"
 New-Item -ItemType Directory -Force -Path "$assetsDir\indexes" | Out-Null
 New-Item -ItemType Directory -Force -Path "$assetsDir\objects" | Out-Null
 
-# Get version json to find asset index
-$manifest = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json' | ConvertFrom-Json
+## Get version json to find asset index
+try {
+    $response = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json' -TimeoutSec 30
+    $manifest = $response.Content | ConvertFrom-Json
+} catch {
+    throw "Failed to download version manifest: $_"
+}
 $v = $manifest.versions | Where-Object { $_.id -eq $version } | Select-Object -First 1
 if (-not $v) {
     throw "Minecraft version $version not found in manifest."
 }
-$vj = Invoke-WebRequest -Uri $v.url | ConvertFrom-Json
+
+try {
+    $response = Invoke-WebRequest -Uri $v.url -TimeoutSec 30
+    $vj = $response.Content | ConvertFrom-Json
+} catch {
+    throw "Failed to download version JSON: $_"
+}
 
 # Download asset index
 $assetIndexUrl = $vj.assetIndex.url
