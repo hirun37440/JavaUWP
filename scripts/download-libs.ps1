@@ -6,11 +6,28 @@ $root = Resolve-RepoRoot
 $gameDir = Get-ConfigPath "GameDir"
 $version = $ProjectConfig.MinecraftVersion
 
-try {
-    $manifest = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json' | ConvertFrom-Json
-} catch {
-    Write-Error "Failed to download version manifest: $_"
-    exit 1
+# Try to load manifest from local cache first, then from API
+$localManifestPath = Join-Path $PSScriptRoot "manifests\version_manifest_v2.json"
+$manifest = $null
+
+if (Test-Path $localManifestPath) {
+    try {
+        Write-Host "Loading manifest from local cache: $localManifestPath"
+        $manifest = Get-Content $localManifestPath | ConvertFrom-Json
+    } catch {
+        Write-Warning "Failed to load local manifest: $_"
+    }
+}
+
+if (-not $manifest) {
+    try {
+        Write-Host "Downloading manifest from Mojang API..."
+        $response = Invoke-WebRequest -Uri 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
+        $manifest = $response | ConvertFrom-Json
+    } catch {
+        Write-Error "Failed to download version manifest: $_"
+        exit 1
+    }
 }
 
 $v = $manifest.versions | Where-Object { $_.id -eq $version } | Select-Object -First 1
